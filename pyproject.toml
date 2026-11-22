@@ -1,0 +1,29 @@
+[project]
+name = "flyby"
+version = "0.1.0"
+description = "Send a video, get where it was filmed: aircraft Doppler curves in the audio, matched against ADS-B tracks"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dopplertrack",
+    "rich>=13.7",
+]
+
+[project.scripts]
+flyby = "flyby.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+# The engine. Pinned to a reviewed commit: it is young third-party code that runs on real data.
+dopplertrack = { git = "https://github.com/mjshiggins/dopplertrack", rev = "2d899bbfe1529e2b4351f328969bb37776d57cb4" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
