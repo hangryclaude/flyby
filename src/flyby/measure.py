@@ -84,7 +84,7 @@ def measure(audio: Path, run: Path, ui) -> tuple[list[Flyover], dict[str, int]]:
 
     spec = run / "rec.npz"
     if not spec.exists():
-        ui.start("Turning the audio into a picture of its low tones")
+        ui.step("spectrogram", then="Measure each pass" if (run / "detected.json").exists() else None)
         part = run / "rec.part.npz"     # so an interrupted run never leaves a half-written picture behind
         run_engine(["spectrogram", str(audio), str(part)], run / "logs" / "spectrogram.log")
         part.rename(spec)
@@ -92,7 +92,7 @@ def measure(audio: Path, run: Path, ui) -> tuple[list[Flyover], dict[str, int]]:
 
     found = run / "detected.json"
     if not found.exists():
-        ui.start("Listening for aircraft")
+        ui.step("listen")
 
         def on_text(text: str) -> None:
             m = re.search(r"window (\d+)/(\d+)", text)
@@ -105,7 +105,7 @@ def measure(audio: Path, run: Path, ui) -> tuple[list[Flyover], dict[str, int]]:
         part.rename(found)
     detections = json.loads(found.read_text())
 
-    ui.start("Measuring each pass")
+    ui.step("passes")
     sp = Spectrogram.load(spec)
     c = speed_of_sound()
     events = run / "events"

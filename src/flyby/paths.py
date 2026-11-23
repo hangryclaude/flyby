@@ -18,7 +18,10 @@ def data_root() -> Path:
 
 def pages_dir() -> Path:
     """Where result pages are written."""
-    return Path(os.environ.get("FLYBY_PAGES") or Path.home() / "dev" / "pages")
+    env = os.environ.get("FLYBY_PAGES")
+    if env:
+        return Path(env)
+    return data_root() / "pages"
 
 
 def prepare_env() -> None:
