@@ -1,17 +1,28 @@
 import base64
+import functools
 import io
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+from PIL import Image
 from rich.console import Console
 
-from flyby import report
-from flyby.model import Clues, Event, Flight, Media, Result
+from flyby import checks, report
+from flyby.model import Clues, Event, Flight, Frame, Media, Result
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
+
+
+@pytest.fixture(autouse=True)
+def no_zone_lookup(monkeypatch):
+    # the sun link asks a web service for the time zone; these tests stay offline
+    monkeypatch.setattr(checks, "_zone", lambda lat, lon: "America/New_York")
+    # the flight replay only reaches a few weeks back, so the test result's day must count as recent
+    monkeypatch.setattr(report, "check_links", functools.partial(checks.check_links, today=date(2026, 1, 10)))
 
 
 def _media(title="Plane video"):
@@ -139,3 +150,57 @@ def test_place_name_fails_soft(monkeypatch):
 
     monkeypatch.setattr(report.urllib.request, "urlopen", boom)
     assert report.place_name(1.0, 2.0) is None
+
+
+def _frame(tmp_path, name, sharpness, t_s, size=(1920, 1080), colour=(200, 40, 40)):
+    path = tmp_path / name
+    Image.new("RGB", size, colour).save(path, "JPEG")
+    return Frame(path, t_s, 0.5, 0.3, sharpness)
+
+
+def test_check_section_follows_the_coordinates(tmp_path):
+    text = report.write_page(_media(), _clues(), _result(), place="Oyster Bay", pages_dir=tmp_path).read_text()
+    coords, section, mapdiv = text.find('id="coords"'), text.find("Check it yourself"), text.find('id="map"')
+    assert 0 < coords < section < mapdiv
+    assert 'href="https://www.google.com/maps/@?api=1&amp;map_action=pano&amp;viewpoint=40.87654,-73.53211"' in text
+    assert "adsb.lol/?icao=a1b2c3" in text and "suncalc.org" in text and "maps.apple.com" in text
+    assert "Do the roads, poles and buildings match the video?" in text
+    assert "Does Street View show this place?" not in text and "data:image/jpeg" not in text
+    assert "See every picture" not in text
+
+
+def test_check_section_with_frames_shows_the_two_sharpest(tmp_path):
+    frames = [_frame(tmp_path, "a.jpg", 1.0, 10.0), _frame(tmp_path, "b.jpg", 9.0, 30125.0),
+              _frame(tmp_path, "c.jpg", 5.0, None, colour=(10, 200, 10))]
+    pics = tmp_path / "flyby-plane-video-pictures.html"
+    text = report.write_page(_media(), _clues(), _result(), pages_dir=tmp_path, frames=frames, pictures_page=pics).read_text()
+    assert "Does Street View show this place?" in text
+    assert text.count("data:image/jpeg;base64,") == 2
+    assert "8:22:05 into the video" in text and "The video&#x27;s own cover picture" in text
+    assert "00:10 into the video" not in text
+    assert 'href="flyby-plane-video-pictures.html"' in text
+    for chunk in text.split("data:image/jpeg;base64,")[1:]:
+        with Image.open(io.BytesIO(base64.b64decode(chunk.split('"')[0]))) as img:
+            assert img.size == (960, 540)
+
+
+def test_check_section_absent_without_a_position(tmp_path):
+    frames = [_frame(tmp_path, "a.jpg", 1.0, 10.0)]
+    text = report.write_page(_media(), _clues(), _result("no match"), pages_dir=tmp_path, frames=frames).read_text()
+    assert "Check it yourself" not in text and "data:image/jpeg" not in text
+
+
+def test_check_links_are_escaped_on_the_page(tmp_path):
+    res = _result()
+    res.flights[0].registration = '<b>"x"</b>'
+    text = report.write_page(_media(), _clues(), res, pages_dir=tmp_path).read_text()
+    assert "<b>" not in text and "Flight replay: &lt;b&gt;&quot;x&quot;&lt;/b&gt;" in text
+
+
+def test_print_result_has_a_short_check_list():
+    out = _render(_result())
+    lines = out.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "Check it")
+    links = [line for line in lines[start + 1:start + 8] if "https://" in line]
+    assert len(links) == 6
+    assert "Street View: https://www.google.com/maps/@?api=1&map_action=pano" in links[0]

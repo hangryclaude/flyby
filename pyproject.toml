@@ -3,6 +3,8 @@ name = "flyby"
 version = "0.1.0"
 description = "Send a video, get where it was filmed: aircraft Doppler curves in the audio, matched against ADS-B tracks"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "dopplertrack",

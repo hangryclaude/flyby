@@ -62,6 +62,11 @@ def test_cached_index_takes_a_wider_box_and_ignores_strangers(tmp_path: Path):
     assert cached_index(day, (24.0, 50.0, -125.0, -66.0), tmp_path) == usa
     assert cached_index(day, (50.5, 52.0, -1.0, 1.0), tmp_path) is None
     assert cached_index(date(2026, 9, 7), (40.0, 41.5, -74.5, -72.5), tmp_path) is None
+    # a small index for that area is taken ahead of the whole-USA one: the engine holds whichever it is given in memory
+    state = tmp_path / "2026-09-08_39.5_42.0_-75.0_-72.0.npz"
+    state.touch()
+    assert cached_index(day, (40.0, 41.5, -74.5, -72.5), tmp_path) == state
+    assert cached_index(day, (40.0, 43.5, -74.5, -72.5), tmp_path) == usa
     assert flights_file(usa).name == "2026-09-08_24.0_50.0_-125.0_-66.0.flights.json"
 
 

@@ -1,11 +1,13 @@
 """Run one command of the engine as its own process, keeping its output and reporting progress."""
 from __future__ import annotations
 
+import fcntl
 import os
 import select
 import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from .model import FlybyError
@@ -17,6 +19,22 @@ NICE = 15
 # The longest the engine has gone without printing in a real whole-USA search is 17 s. Its
 # worker pool waits for ever on a worker that was killed, so a long silence means it is stuck.
 STALL_S = 900
+
+
+@contextmanager
+def one_at_a_time(folder: Path, on_wait=None):
+    """Hold the one place for work that fills the memory. A second whole-USA search started
+    beside the first pushed a 48 GB Mac 15 GB past full, and both ran at a quarter speed.
+    on_wait is called once if another flyby holds the place; then this waits for it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "busy.lock", "w") as held:
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if on_wait:
+                on_wait()
+            fcntl.flock(held, fcntl.LOCK_EX)
+        yield       # closing the file gives the place up, however this ends
 
 
 def _stop(proc: subprocess.Popen) -> None:
@@ -38,15 +56,20 @@ def _stop(proc: subprocess.Popen) -> None:
             signal.signal(sig, was)
 
 
-def run_engine(args: list[str], log_path: Path, on_text=None, stall_s: float | None = None) -> None:
+def run_engine(args: list[str], log_path: Path, on_text=None, stall_s: float | None = None,
+               air_c: float | None = None) -> None:
     """Run `dopplertrack <args>`. Everything it prints goes to log_path; on_text sees each piece
     as it arrives (the engine redraws some progress lines with a bare carriage return).
-    stall_s: give up when it prints nothing for this long (only the search reports often enough)."""
+    stall_s: give up when it prints nothing for this long (only the search reports often enough).
+    air_c: the air temperature the engine should take the speed of sound at (see enginecli)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["nice", "-n", str(NICE), sys.executable, "-m", "dopplertrack.cli", *args]
+    cmd = ["nice", "-n", str(NICE), sys.executable, "-m", "flyby.enginecli", *args]
+    env = engine_env()
+    if air_c is not None:
+        env["FLYBY_AIR_C"] = str(air_c)
     with open(log_path, "wb") as log:
-        log.write((" ".join(cmd) + "\n").encode())
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=engine_env(),
+        log.write(((f"FLYBY_AIR_C={air_c} " if air_c is not None else "") + " ".join(cmd) + "\n").encode())
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                 bufsize=0, start_new_session=True)
         try:
             while True:

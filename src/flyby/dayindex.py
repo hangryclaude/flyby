@@ -11,14 +11,20 @@ import collections
 import http.client
 import io
 import json
+import math
+import re
+import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
+
+import numpy as np
 
 from .model import CONUS, FlybyError, NoFlightData
 
@@ -27,18 +33,22 @@ UA = {"User-Agent": "flyby/0.1 (personal research tool)"}
 CHUNK = 8 << 20
 CONNS = 8
 BUILD_PEAK_GB = 14      # measured: a whole-USA day while the engine assembles its index
-BUILD_SPARE_GB = 2
+SQUEEZE_GB = 6          # measured on a 48 GB Mac: 8 GB past full ran slow but steady, 15 GB past full thrashed
+PAD_DEG = 0.3           # a pass is heard from 12 km and a track is sampled every 10 s; 0.3 degrees is 23 km at 45 N
+SMALL_SHARE = 0.25      # a search box under this share of an index's own box gets a small index cut for it
 
 
 def free_memory_gb() -> float | None:
-    """What macOS itself counts as available memory, the figure Activity Monitor's pressure graph follows."""
+    """Memory that can be had without squeezing other apps: free pages plus cached files.
+    kern.memorystatus_level is no use for this. It also counts idle app memory, which must be
+    compressed before it can be handed over: it read 20 GB on a Mac with 0.2 GB free and
+    21 GB already compressed."""
     if sys.platform != "darwin":
         return None
-
-    def sysctl(name: str) -> int:
-        return int(subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, check=True).stdout)
-
-    return sysctl("hw.memsize") * sysctl("kern.memorystatus_level") / 100 / 2 ** 30
+    out = subprocess.run(["vm_stat"], stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout
+    page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+    pages = {m[1]: int(m[2]) for m in re.finditer(r"^(.+?):\s+(\d+)\.$", out, re.M)}
+    return sum(pages[k] for k in ("Pages free", "Pages speculative", "Pages purgeable", "File-backed pages")) * page / 2 ** 30
 
 
 def release_assets(day: date) -> list[tuple[str, int]]:
@@ -123,6 +133,28 @@ def _covers(outer, inner) -> bool:
     return outer[0] <= inner[0] and outer[1] >= inner[1] and outer[2] <= inner[2] and outer[3] >= inner[3]
 
 
+def _area(box) -> float:
+    return (box[1] - box[0]) * (box[3] - box[2])
+
+
+def grid_box(bbox) -> tuple[float, float, float, float]:
+    """bbox moved outward to the 0.1 degree grid an index file is named on, so the name never claims less than was built."""
+    return (max(math.floor(bbox[0] * 10) / 10, -90.0), min(math.ceil(bbox[1] * 10) / 10, 90.0),
+            max(math.floor(bbox[2] * 10) / 10, -180.0), min(math.ceil(bbox[3] * 10) / 10, 180.0))
+
+
+def _padded(bbox) -> tuple[float, float, float, float]:
+    """bbox plus the margin a flight outside it can still be heard across."""
+    wide = PAD_DEG / max(math.cos(math.radians(max(abs(bbox[0]), abs(bbox[1])))), 0.2)
+    return bbox[0] - PAD_DEG, bbox[1] + PAD_DEG, bbox[2] - wide, bbox[3] + wide
+
+
+def is_small_part(bbox, index: Path) -> bool:
+    """Is bbox so much smaller than the box this index was built for that a cut of it is worth making?"""
+    have = index_box(index)
+    return bool(have) and _area(grid_box(bbox)) < SMALL_SHARE * _area(have)
+
+
 def index_box(index: Path) -> tuple[float, ...] | None:
     """The box an index file was built for, read back from its name."""
     try:
@@ -133,12 +165,76 @@ def index_box(index: Path) -> tuple[float, ...] | None:
 
 
 def cached_index(day: date, bbox, root: Path) -> Path | None:
-    """An index on disk that serves this day and box. A wider box will do: the search narrows it."""
-    for p in sorted(root.glob(f"{day}_*.npz")):
-        have = index_box(p)
-        if have and not p.name.endswith(".part.npz") and _covers(have, bbox):
-            return p
-    return None
+    """The smallest index on disk that serves this day and box. A wider box will do: the search narrows it."""
+    fits = [(_area(have), p) for p in sorted(root.glob(f"{day}_*.npz"))
+            if not p.name.endswith(".part.npz") and (have := index_box(p)) and _covers(have, bbox)]
+    return min(fits)[1] if fits else None
+
+
+def mapped(path: Path, name: str) -> np.memmap:
+    """One array of an uncompressed .npz, mapped instead of read."""
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(name + ".npy")
+    if info.compress_type != zipfile.ZIP_STORED:
+        raise ValueError(f"{path.name} is compressed, so it cannot be mapped")
+    with open(path, "rb") as fh:
+        fh.seek(info.header_offset + 26)
+        n_name, n_extra = struct.unpack("<HH", fh.read(4))
+        fh.seek(info.header_offset + 30 + n_name + n_extra)
+        major, _ = np.lib.format.read_magic(fh)
+        read = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
+        shape, fortran, dtype = read(fh)
+        offset = fh.tell()
+    return np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=shape, order="F" if fortran else "C")
+
+
+def cut_index(src: Path, bbox, out: Path) -> Path:
+    """Write the part of a day index that a search of bbox can touch, as a small index of its own.
+
+    The engine reads an index whole and holds it for the length of a search: 7 GB for a
+    whole-USA day. A state needs a few percent of that. Every flight with a position in the
+    box, or within the margin a pass can be heard across, is kept whole, in the same frame and
+    the same order, so a search of the box pairs and scores exactly what it would have.
+    The source is mapped, not read, so making the cut takes little memory itself.
+    parent_seg in the cut gives, for each flight kept, its number in the source."""
+    from dopplertrack.geo import enu_to_lla
+
+    z = np.load(src)
+    off, lat0, lon0 = z["off"], float(z["lat0"]), float(z["lon0"])
+    sb, ss, sj, t, enu, spd = (mapped(src, n) for n in ("sb", "ss", "sj", "t", "enu", "spd"))
+    seg_of = np.asarray(ss)
+    rows = off[seg_of] + np.asarray(sj)
+    south, north, west, east = _padded(bbox)
+    keep = np.zeros(len(off) - 1, bool)
+    order = np.argsort(rows)            # file order, so the disk is read front to back
+    for part in np.array_split(order, max(len(order) // 2_000_000, 1)):     # in pieces: a whole-USA day has 15 million samples
+        e, n, u = np.asarray(enu[rows[part]]).T
+        lat, lon, _ = enu_to_lla(e, n, u, lat0, lon0)
+        keep[seg_of[part[(lat >= south) & (lat <= north) & (lon >= west) & (lon <= east)]]] = True
+    kept = np.flatnonzero(keep)
+    if not len(kept):
+        raise NoFlightData(f"no propeller flights were recorded over that area on {src.stem.split('_')[0]}")
+
+    new_off = np.r_[0, np.cumsum(off[kept + 1] - off[kept])].astype(off.dtype)
+    cut = {name: np.empty((new_off[-1], *arr.shape[1:]), arr.dtype) for name, arr in (("t", t), ("enu", enu), ("spd", spd))}
+    for k, i in enumerate(kept):
+        for name, arr in (("t", t), ("enu", enu), ("spd", spd)):
+            cut[name][new_off[k]:new_off[k + 1]] = arr[off[i]:off[i + 1]]
+    new_number = np.cumsum(keep) - 1
+    mine = keep[seg_of]                 # the samples of the flights kept, still in bucket order
+    part = out.with_suffix(".part.npz")     # so an interrupted run never leaves a half-written index in the cache
+    try:
+        np.savez(part, lat0=lat0, lon0=lon0, bucket_s=float(z["bucket_s"]), off=new_off, **cut, icao=z["icao"][kept],
+                 trace_idx=z["trace_idx"][kept], sb=np.asarray(sb)[mine], ss=new_number[seg_of[mine]].astype(ss.dtype),
+                 sj=np.asarray(sj)[mine], parent_seg=kept.astype(np.int32))
+        if flights_file(src).exists():
+            known, here = json.loads(flights_file(src).read_text()), set(z["icao"][kept].tolist())
+            flights_file(out).write_text(json.dumps({icao: about for icao, about in known.items() if icao in here}))
+        part.rename(out)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    return out
 
 
 def flights_file(index: Path) -> Path:
@@ -155,17 +251,21 @@ def build_day_index(day: date, bbox, root: Path, progress=None) -> Path:
     from dopplertrack.search import DayIndex
 
     # asked before the 4 GB stream, not after it: a Mac pushed 14 GB past full freezes rather than fails
-    free = free_memory_gb() if tuple(bbox) == CONUS else None
-    if free is not None and free < BUILD_PEAK_GB + BUILD_SPARE_GB:
+    whole_usa = tuple(bbox) == CONUS
+    free = free_memory_gb() if whole_usa else None
+    if free is not None and free < BUILD_PEAK_GB - SQUEEZE_GB:
         raise FlybyError(f"indexing a whole-USA day of flights takes about {BUILD_PEAK_GB} GB of memory for a minute or two, "
-                         f"and only {free:.0f} GB is free right now. Close some apps and run the same command again.")
+                         f"and only {free:.0f} GB is free right now. Close some apps and run the same command again, "
+                         "or name a state with --area: that takes under 1 GB.")
     root.mkdir(parents=True, exist_ok=True)
     out = root / f"{day}_{_tag(bbox)}.npz"
     stream = RangedStream(release_assets(day))
     types = AircraftTypes()
     hook = (lambda n, _: progress(stream.total, stream.size, n)) if progress else None
+    # the name says which searches the index serves; a smaller box also holds the flights just outside it
+    reach = bbox if whole_usa else _padded(bbox)
     try:
-        traces = [t for t in iter_tar_traces(io.BufferedReader(stream, 1 << 22), bbox, hook) if types.is_prop(t.typ)]
+        traces = [t for t in iter_tar_traces(io.BufferedReader(stream, 1 << 22), reach, hook) if types.is_prop(t.typ)]
     finally:
         stream.close()
     if progress:
